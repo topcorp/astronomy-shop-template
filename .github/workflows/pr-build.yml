@@ -1,0 +1,63 @@
+# Builds the services a pull request changes, the way upstream builds its
+# images (context ".", the service's Dockerfile under src/), and pushes
+# nothing. A change under pb/ builds every service, since they copy the protos.
+name: PR build
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-build-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  changed:
+    runs-on: ubuntu-24.04
+    outputs:
+      services: ${{ steps.pick.outputs.services }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - id: pick
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          dockerfile() { for f in "src/$1/Dockerfile" "src/$1/src/Dockerfile"; do [ -f "$f" ] && echo "$f" && return; done; }
+          changed=$(git diff --name-only "$BASE" HEAD)
+          if grep -q '^pb/' <<<"$changed"; then
+            dirs=$(ls src)
+          else
+            dirs=$(grep '^src/' <<<"$changed" | cut -d/ -f2 | sort -u || true)
+          fi
+          services=()
+          for d in $dirs; do
+            if [ -n "$(dockerfile "$d")" ]; then services+=("$d"); fi
+          done
+          echo "services=$(jq -cn '$ARGS.positional' --args "${services[@]}")" >>"$GITHUB_OUTPUT"
+          echo "To build: ${services[*]:-nothing}"
+
+  build:
+    needs: changed
+    if: needs.changed.outputs.services != '[]'
+    name: build ${{ matrix.service }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        service: ${{ fromJSON(needs.changed.outputs.services) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: docker build
+        env:
+          SERVICE: ${{ matrix.service }}
+        run: |
+          dockerfile() { for f in "src/$1/Dockerfile" "src/$1/src/Dockerfile"; do [ -f "$f" ] && echo "$f" && return; done; }
+          env_value() { grep -E "^$1=" .env | cut -d= -f2-; }
+          docker build -f "$(dockerfile "$SERVICE")" \
+            --build-arg OTEL_JAVA_AGENT_VERSION="$(env_value OTEL_JAVA_AGENT_VERSION)" \
+            --build-arg OPENTELEMETRY_CPP_VERSION="$(env_value OPENTELEMETRY_CPP_VERSION)" \
+            -t "lab/$SERVICE:pr" .
